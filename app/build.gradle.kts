@@ -12,8 +12,8 @@ android {
         applicationId = "com.antigravity.geospoofer"
         minSdk = 26
         targetSdk = 35
-        versionCode = 14
-        versionName = "1.2.9"
+        versionCode = 17
+        versionName = "1.3.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

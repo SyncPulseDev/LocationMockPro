@@ -46,6 +46,9 @@
             android:name="xposedmodule"
             android:value="true" />
         <meta-data
+            android:name="xposedsharedprefs"
+            android:value="true" />
+        <meta-data
             android:name="xposeddescription"
             android:value="LocationMockPro 极客防检测免杀与物理传感器仿真 Hook 模块" />
         <meta-data

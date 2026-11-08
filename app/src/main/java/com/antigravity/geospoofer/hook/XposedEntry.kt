@@ -34,12 +34,20 @@ import de.robv.android.xposed.XSharedPreferences
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.io.ByteArrayInputStream
+import java.io.DataInputStream
 import java.lang.ref.WeakReference
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.util.Calendar
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * LocationMockPro 顶级 LSPosed / Xposed 免杀 Hook 核心引擎 (Phase 3.0 终审加固版)
@@ -68,19 +76,79 @@ class XposedEntry : IXposedHookLoadPackage {
 
     private val hookedListeners = ConcurrentHashMap<Int, Boolean>()
     private val hookedLocationListeners = ConcurrentHashMap<Int, Boolean>()
+    private val hookedGnssCallbacks = ConcurrentHashMap<Int, Boolean>()
 
-    // 计步器开机硬件真实步数基准值（记录首次硬件回调，默认 12580f 优雅垫底）
+    @Volatile private var currentPackageName: String = ""
+    @Volatile private var isCampusMultiSensorApp: Boolean = false
+
+    // 计步器开机硬件真实步数基准值（记录首次硬件回调，默认 12580f 优雅垫底）与跨会话单调累加锁
     @Volatile private var baseHardwareSteps: Float = 12580f
     @Volatile private var hasCapturedRealHardwareStep: Boolean = false
     @Volatile private var lastDispatchedStepCount: Long = -1L
+    private val stepStateLock = Any()
+    private var accumulatedPriorSteps: Long = 0L
+    private var maxCurrentSessionSteps: Long = 0L
+
+    // 三轴加速度计连续相位积分器（根治 f(t)*t 调频啁啾跳变与 100s 取模断相，实现 C^∞ 平滑步态波形）
+    private val accelPhaseLock = Any()
+    private var accelStridePhaseRad: Double = 0.0
+    private var lastAccelPhaseNanos: Long = 0L
+    @Volatile private var lastNativeAccelEventMs: Long = 0L
+    private val isSyntheticAccelDispatch = ThreadLocal<Boolean>()
+    private val isAccelPumpRunning = AtomicBoolean(false)
 
     // 活跃 Listener 调度封装器与调度器线程
     private val activeDispatchers = ConcurrentHashMap<Int, ListenerDispatcher>()
     private val activeStepListeners = ConcurrentHashMap<Int, StepListenerInfo>()
-    private val activeGnssCallbacks = ConcurrentHashMap<Int, WeakReference<android.location.GnssStatus.Callback>>()
+    private val activeAccelListeners = ConcurrentHashMap<Int, StepListenerInfo>()
+    private val activeGnssCallbacks = ConcurrentHashMap<Int, GnssCallbackInfo>()
     private val activeNmeaListeners = ConcurrentHashMap<Int, NmeaListenerInfo>()
     @Volatile private var isDispatcherRunning = false
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+
+    private fun detectCampusMultiSensorApp(pkg: String): Boolean {
+        val lower = pkg.lowercase(Locale.US)
+        return lower.contains("zjwh") ||
+            lower.contains("physicalfitness") ||
+            lower.contains("yundong") ||
+            lower.contains("paobu") ||
+            lower.contains("lepao") ||
+            lower.contains("co.runner") ||
+            lower.contains("fifedu") ||
+            lower.contains("wanmei") ||
+            lower.contains("campus") ||
+            lower.contains("sunshine") ||
+            lower.contains("sportcampus")
+    }
+
+    /**
+     * 跨会话严格单调递增硬件步数合成器：
+     * 当用户结束并开启第二轮路线模拟（rawSessionSteps 归零）时，自动将上一轮峰值折算入历史偏移，
+     * 严格遵守 Android TYPE_STEP_COUNTER 自开机单调不减契约，杜绝二次开跑丢步或负跳变风控。
+     */
+    private fun computeMonotonicStepCounterValue(rawSessionSteps: Long): Float {
+        val safeRaw = rawSessionSteps.coerceAtLeast(0L)
+        val totalSimulatedSteps = synchronized(stepStateLock) {
+            if (safeRaw < maxCurrentSessionSteps) {
+                accumulatedPriorSteps += maxCurrentSessionSteps
+                maxCurrentSessionSteps = safeRaw
+            } else if (safeRaw > maxCurrentSessionSteps) {
+                maxCurrentSessionSteps = safeRaw
+            }
+            accumulatedPriorSteps + maxCurrentSessionSteps
+        }
+        return baseHardwareSteps + totalSimulatedSteps.toFloat()
+    }
+
+    private fun isFakeStepSensorInstance(sensor: Sensor): Boolean {
+        return try {
+            sensor.name.contains("BOSCH") ||
+                sensor.vendor.contains("Bosch") ||
+                XposedHelpers.getIntField(sensor, "mHandle") < 0
+        } catch (_: Throwable) {
+            false
+        }
+    }
 
     private class StepListenerInfo(
         val weakListener: WeakReference<SensorEventListener>,
@@ -88,6 +156,37 @@ class XposedEntry : IXposedHookLoadPackage {
         val targetHandler: Handler?
     ) {
         fun isAlive(): Boolean = weakListener.get() != null
+    }
+
+    private class GnssCallbackInfo(
+        val weakCallback: WeakReference<android.location.GnssStatus.Callback>,
+        val targetHandler: Handler?,
+        val targetExecutor: Executor?
+    ) {
+        @Volatile var hasSentFirstFix: Boolean = false
+
+        fun isAlive(): Boolean = weakCallback.get() != null
+
+        fun dispatch(defaultMainHandler: Handler, action: (android.location.GnssStatus.Callback) -> Unit) {
+            if (weakCallback.get() == null) return
+            val runnable = Runnable {
+                val cb = weakCallback.get() ?: return@Runnable
+                try { action(cb) } catch (_: Throwable) {}
+            }
+            if (targetExecutor != null) {
+                try {
+                    targetExecutor.execute(runnable)
+                    return
+                } catch (_: Throwable) {}
+            }
+            if (targetHandler != null) {
+                try {
+                    targetHandler.post(runnable)
+                    return
+                } catch (_: Throwable) {}
+            }
+            try { defaultMainHandler.post(runnable) } catch (_: Throwable) {}
+        }
     }
 
     private class NmeaListenerInfo(
@@ -131,9 +230,31 @@ class XposedEntry : IXposedHookLoadPackage {
         }
     }
 
-    // 进程内缓存模拟状态（避免高频 IPC 跨进程开销，1 秒缓存过期刷新）
-    private var cachedState: RemoteState? = null
-    private var lastFetchTime = 0L
+    // 进程内无锁缓存模拟状态（由后台 StateSyncDaemon 异步拉取更新，主线程/100Hz 传感器回调 O(1) 纳秒级无阻塞读取）
+    @Volatile private var cachedState: RemoteState = RemoteState(
+        isMocking = false,
+        latitude = 39.908823,
+        longitude = 116.397470,
+        altitude = 35.0,
+        speed = 0f,
+        bearing = 0f,
+        accuracy = 3.2f,
+        satellites = 16,
+        meanCn0 = 33.5f,
+        totalSteps = 0L,
+        cadenceSpm = 0,
+        wifiMockEnabled = false,
+        wifiSsid = "Company-Office-5G",
+        wifiBssid = "00:1a:2b:3c:4d:5e",
+        wifiRssi = -52,
+        cellMockEnabled = false,
+        cellMcc = 460,
+        cellMnc = 0,
+        cellLac = 41021,
+        cellCid = 1892341
+    )
+    private val initialSyncLatch = CountDownLatch(1)
+    private val isStateSyncRunning = AtomicBoolean(false)
 
     data class RemoteState(
         val isMocking: Boolean,
@@ -257,10 +378,24 @@ class XposedEntry : IXposedHookLoadPackage {
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
-        // 排除宿主应用自身以及核心框架
-        if (lpparam.packageName == "com.antigravity.geospoofer") return
+        // 排除宿主应用自身（主进程与任意子进程/渲染进程）以及系统底层框架
+        if (lpparam.packageName == "com.antigravity.geospoofer" ||
+            lpparam.processName == "com.antigravity.geospoofer" ||
+            lpparam.processName.startsWith("com.antigravity.geospoofer:") ||
+            lpparam.appInfo?.packageName == "com.antigravity.geospoofer") {
+            return
+        }
+        if (lpparam.packageName == "android" || lpparam.packageName == "com.android.systemui") {
+            return
+        }
+
+        currentPackageName = lpparam.packageName
+        isCampusMultiSensorApp = detectCampusMultiSensorApp(lpparam.packageName)
 
         try {
+            // ================= 0. 预热异步多通道状态同步守护线程 =================
+            ensureStateSyncDaemon()
+
             // ================= 1. 抹除 Android 虚拟定位一切底层标志位 =================
             hookMockFlags(lpparam)
 
@@ -482,8 +617,15 @@ class XposedEntry : IXposedHookLoadPackage {
 
                         if (sensor.type == Sensor.TYPE_STEP_COUNTER || sensor.type == Sensor.TYPE_STEP_DETECTOR || sensor.type == Sensor.TYPE_ACCELEROMETER) {
                             hookSensorEventListener(listener)
-                            if (sensor.type == Sensor.TYPE_STEP_COUNTER || sensor.type == Sensor.TYPE_STEP_DETECTOR) {
-                                val key = System.identityHashCode(listener) xor (sensor.type shl 16)
+                            val key = System.identityHashCode(listener) xor (sensor.type shl 16)
+                            if (sensor.type == Sensor.TYPE_ACCELEROMETER) {
+                                activeAccelListeners[key] = StepListenerInfo(
+                                    WeakReference(listener),
+                                    sensor,
+                                    targetHandler
+                                )
+                                ensureAccelFallbackPump()
+                            } else {
                                 activeStepListeners[key] = StepListenerInfo(
                                     WeakReference(listener),
                                     sensor,
@@ -493,8 +635,21 @@ class XposedEntry : IXposedHookLoadPackage {
                                 ensureActiveDispatcher()
 
                                 // 极其关键：拦截底层注册，严禁将伪传感器透传给系统引发误绑物理加速度计 (mHandle=0)
-                                val isFakeSensor = sensor.name.contains("BOSCH") || sensor.vendor.contains("Bosch") || (try { XposedHelpers.getIntField(sensor, "mHandle") < 0 } catch (_: Throwable) { false })
-                                if (isFakeSensor) {
+                                if (isFakeStepSensorInstance(sensor)) {
+                                    // 模拟器/虚拟计步器：立即向宿主 Listener 投递硬件开机基准步数，满足传感器校准契约
+                                    if (sensor.type == Sensor.TYPE_STEP_COUNTER) {
+                                        val h = targetHandler ?: mainHandler
+                                        h.postDelayed({
+                                            try {
+                                                val state = getSimState()
+                                                val currentSteps = if (state?.isMocking == true) state.totalSteps else 0L
+                                                val ev = createFakeSensorEvent(sensor, computeMonotonicStepCounterValue(currentSteps))
+                                                if (ev != null) {
+                                                    listener.onSensorChanged(ev)
+                                                }
+                                            } catch (_: Throwable) {}
+                                        }, 150L)
+                                    }
                                     param.result = true
                                     return
                                 }
@@ -516,11 +671,14 @@ class XposedEntry : IXposedHookLoadPackage {
                         val sensor = param.args.getOrNull(1) as? Sensor
                         val listenerHash = System.identityHashCode(listener)
                         if (sensor != null) {
-                            activeStepListeners.remove(listenerHash xor (sensor.type shl 16))
+                            val key = listenerHash xor (sensor.type shl 16)
+                            activeStepListeners.remove(key)
+                            activeAccelListeners.remove(key)
                         } else {
                             activeStepListeners.remove(listenerHash xor (Sensor.TYPE_STEP_COUNTER shl 16))
                             activeStepListeners.remove(listenerHash xor (Sensor.TYPE_STEP_DETECTOR shl 16))
                             activeStepListeners.remove(listenerHash)
+                            activeAccelListeners.remove(listenerHash xor (Sensor.TYPE_ACCELEROMETER shl 16))
                         }
                     }
                 })
@@ -610,72 +768,150 @@ class XposedEntry : IXposedHookLoadPackage {
                     if (!state.isMocking) return
 
                     if (event.sensor.type == Sensor.TYPE_STEP_COUNTER) {
-                        val spoofedVal = baseHardwareSteps + state.totalSteps.toFloat()
-                        // 首次捕获并永久锁定硬件开机真实步数，严禁运行中基准突变引发千步跳跃与 533 SPM 风控拦截
-                        if (!hasCapturedRealHardwareStep && event.values.isNotEmpty() && event.values[0] > 0f) {
+                        val spoofedVal = computeMonotonicStepCounterValue(state.totalSteps)
+                        // 首次捕获并永久锁定真实物理硬件开机步数（排除模块自身虚拟传感器与合成值）
+                        if (!hasCapturedRealHardwareStep &&
+                            !isFakeStepSensorInstance(event.sensor) &&
+                            event.values.isNotEmpty() &&
+                            event.values[0] > 0f
+                        ) {
                             val rawVal = event.values[0]
                             if (rawVal != spoofedVal && rawVal < 2000000f) {
                                 baseHardwareSteps = rawVal
                             }
                             hasCapturedRealHardwareStep = true
                         }
-                        // 注入基准值 + 模拟位移累加步数（严格单调递增，杜绝千步突跳）
                         if (event.values.isNotEmpty()) {
-                            event.values[0] = baseHardwareSteps + state.totalSteps.toFloat()
+                            event.values[0] = computeMonotonicStepCounterValue(state.totalSteps)
                         }
                     } else if (event.sensor.type == Sensor.TYPE_STEP_DETECTOR) {
-                        // 物理硬件微动全面屏蔽：在位移模拟激活期间，全面阻断真实硬件物理微动脉冲，彻底杜绝手持晃动与虚拟步数混淆串扰
-                        param.result = null
-                        return
-                    } else if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
-                        // 核心防冲突：若宿主 App 已注册权威 TYPE_STEP_COUNTER，由硬件计数器独占步数更新，
-                        // 加速度计保持平稳重力基准 (0, 9.80665, 0)，杜绝运动世界校园等 App 内部多传感器计步融合算法引发步频翻倍/翻四倍！
+                        // 若宿主已监听权威 STEP_COUNTER，屏蔽物理微动脉冲；仅监听 STEP_DETECTOR 时允许合成单步脉冲通过
                         val hasCounter = activeStepListeners.values.any { it.sensor.type == Sensor.TYPE_STEP_COUNTER && it.isAlive() }
-                        if (hasCounter) {
-                            if (event.values.size >= 3) {
-                                event.values[0] = 0f
-                                event.values[1] = 9.80665f
-                                event.values[2] = 0f
-                            }
+                        if (hasCounter || !isFakeStepSensorInstance(event.sensor)) {
+                            param.result = null
                             return
                         }
-
-                        // 当目标运动 App（如 Keep/悦跑圈仅监听加速度计）通过加速度计进行跑姿分析与实时步频解算时
-                        // 核心运动生理学：人体一个完整步态周期（Gait Cycle/Stride）包含左脚与右脚两次单步（2 Steps）
-                        // Keep 等运动 App 的加速度计峰谷/过零检测算法对单轴正弦波每个半波均判定为一次触地计步（1 Cycle = 2 Steps）
-                        // 因此波形振荡频率必须精确锁定跨步频率（Stride Frequency = Cadence / 120.0 Hz）
-                        // 彻底根治因误用单步频率（Cadence / 60）导致 Keep 识别出 231 SPM 甚至 428 SPM 鬼畜步频的顽疾！
-                        if (state.speed > 0.4f && state.cadenceSpm > 0 && event.values.size >= 3) {
-                            val cadence = state.cadenceSpm.coerceIn(80, 205)
-                            val strideFreqHz = cadence / 120.0
-                            val tSec = (SystemClock.elapsedRealtimeNanos() % 100_000_000_000L) / 1_000_000_000.0
-                            val stridePhase = 2.0 * Math.PI * strideFreqHz * tSec
-
-                            // 振幅自适应人体运动动力学：慢走 (1.35m/s) 垂直振荡 0.85m/s²，跑步 (3.5m/s) 达 2.2m/s²
-                            val vertAmp = when {
-                                state.speed <= 1.8f -> (0.6f + (state.speed - 0.4f) * 0.4f).coerceIn(0.6f, 1.2f)
-                                state.speed <= 3.5f -> (1.2f + (state.speed - 1.8f) * 0.6f).coerceIn(1.2f, 2.2f)
-                                else -> (2.2f + (state.speed - 3.5f) * 0.3f).coerceIn(2.2f, 2.8f)
-                            }
-
-                            // Y 轴主垂直运动冲击波 (9.80665 m/s² 重力基底 + 严格跨步频率振荡，产生左右脚各一次落地冲击峰值)
-                            event.values[1] = (9.80665 + Math.sin(stridePhase) * vertAmp).toFloat()
-                            // X 轴左右迈步侧摆 (严格对齐跨步半频，振幅适度，严禁产生正交高次谐波)
-                            event.values[0] = (Math.sin(stridePhase * 0.5) * (vertAmp * 0.2f)).toFloat()
-                            // Z 轴身体前后微幅俯仰 (严格同相微幅，杜绝正交余弦波引发额外导数峰值导致 4x 触发)
-                            event.values[2] = (Math.sin(stridePhase) * (vertAmp * 0.15f)).toFloat()
-                        } else {
-                            // 原地驻留或静止态：平稳重力基准 (0, 9.80665, 0)，彻底消除假动作步数干扰
-                            if (event.values.size >= 3) {
-                                event.values[0] = 0f
-                                event.values[1] = 9.80665f
-                                event.values[2] = 0f
-                            }
+                    } else if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
+                        if (isSyntheticAccelDispatch.get() != true) {
+                            lastNativeAccelEventMs = System.currentTimeMillis()
+                        }
+                        if (event.values.size >= 3) {
+                            val sampleNanos = if (event.timestamp > 0L) event.timestamp else SystemClock.elapsedRealtimeNanos()
+                            populateSpoofedAccelerometer(event.values, sampleNanos, state)
                         }
                     }
                 }
             })
         } catch (_: Throwable) {}
+    }
+
+    /**
+     * 连续相位积分器：确保速度与步频实时微幅波动时瞬时频率严格等于目标步频 (dφ/dt = 2π·f(t))，
+     * 彻底根治传统 2π·f(t)·t 引发的 t·df/dt 调频相位跳变（231~428 SPM 鬼畜步频真凶）与 100s 取模断相。
+     */
+    private fun advanceAndGetStridePhase(nowNanos: Long, cadenceSpm: Int): Double {
+        synchronized(accelPhaseLock) {
+            if (lastAccelPhaseNanos != 0L) {
+                val dtNanos = nowNanos - lastAccelPhaseNanos
+                if (dtNanos > 500_000L) { // > 0.5ms 才推进相位，防止同帧多 Listener 重复积分倍频
+                    val clampedDtSec = dtNanos.coerceAtMost(200_000_000L) / 1_000_000_000.0
+                    val strideFreqHz = cadenceSpm.coerceIn(75, 205) / 120.0
+                    accelStridePhaseRad = (accelStridePhaseRad + 2.0 * Math.PI * strideFreqHz * clampedDtSec) % (2.0 * Math.PI)
+                    lastAccelPhaseNanos = nowNanos
+                }
+            } else {
+                lastAccelPhaseNanos = nowNanos
+            }
+            return accelStridePhaseRad
+        }
+    }
+
+    /**
+     * 智能分场景三轴加速度生物力学合成：
+     * 1. 校园多源融合跑类 App（如运动世界校园、步道乐跑等同时监听 STEP_COUNTER + ACCELEROMETER 累加计步）：
+     *    在已存在权威 STEP_COUNTER 时输出低于计步阈值的手持生理微颤（方差 > 0 防冻结检测，且 0 额外计步冲突）。
+     * 2. 专业运动步态分析类 App（如 Keep 后台注册每日 STEP_COUNTER，户外跑由 100Hz 加速度计解算实时步频/步幅）：
+     *    输出连续相位积分的三轴步态冲击波形（Y/Z 轴对齐单步触地频率 Cadence/60 Hz，X 轴对齐跨步侧摆半频 Cadence/120 Hz）。
+     */
+    private fun populateSpoofedAccelerometer(values: FloatArray, sampleNanos: Long, state: RemoteState) {
+        val tSec = (sampleNanos % 3_600_000_000_000L) / 1_000_000_000.0
+        val microNoise = (((sampleNanos / 1_000_000L) % 19L).toFloat() - 9f) * 0.0018f
+        val hasCounter = activeStepListeners.values.any { it.sensor.type == Sensor.TYPE_STEP_COUNTER && it.isAlive() }
+
+        if ((isCampusMultiSensorApp && hasCounter) || state.speed <= 0.4f || state.cadenceSpm <= 0) {
+            // 亚阈值手持呼吸/姿态自然微幅漂移（幅值 ±0.05 m/s² << 计步器触发阈值 1.2 m/s²，消除死板 0 方差风控特征）
+            values[0] = (0.13 + Math.sin(tSec * 2.1) * 0.038 + microNoise).toFloat()
+            values[1] = (9.78 + Math.sin(tSec * 1.4) * 0.045 - microNoise).toFloat()
+            values[2] = (0.68 + Math.cos(tSec * 1.8) * 0.035 + microNoise * 0.7f).toFloat()
+            return
+        }
+
+        val stridePhase = advanceAndGetStridePhase(sampleNanos, state.cadenceSpm)
+        val stepPhase = stridePhase * 2.0 // 单步触地相位 (Cadence / 60.0 Hz)
+
+        val vertAmp = when {
+            state.speed <= 1.8f -> (0.95f + (state.speed - 0.4f) * 0.42f).coerceIn(0.95f, 1.55f)
+            state.speed <= 3.5f -> (1.55f + (state.speed - 1.8f) * 0.72f).coerceIn(1.55f, 2.80f)
+            else -> (2.80f + (state.speed - 3.5f) * 0.35f).coerceIn(2.80f, 3.60f)
+        }
+
+        // X 轴：骨盆与手臂左右交替摆动（严格对齐跨步半频）
+        values[0] = (0.12 + Math.sin(stridePhase) * (vertAmp * 0.22f) + microNoise).toFloat()
+        // Y 轴：垂直落地反作用力主波（含轻微触地/腾空非对称二次谐波，单周期严格单峰单谷）
+        values[1] = (9.78 + Math.sin(stepPhase) * vertAmp + Math.sin(stepPhase * 2.0 - 0.785) * (vertAmp * 0.14f) - microNoise).toFloat()
+        // Z 轴：前后蹬伸俯仰分量（与主波同相，保持三维合加速度模长严格每步单峰）
+        values[2] = (0.65 + Math.sin(stepPhase) * (vertAmp * 0.20f) + microNoise).toFloat()
+    }
+
+    /**
+     * 模拟器静音加速度计兜底泵：
+     * 若真机或模拟器底层已正常推送加速度事件（间隔 < 180ms），本线程完全休眠零开销；
+     * 若无头/静止模拟器虚拟加速度计沉默不发回调，则自动以 50Hz (20ms) 补齐步态采样流。
+     */
+    private fun ensureAccelFallbackPump() {
+        if (!isAccelPumpRunning.compareAndSet(false, true)) return
+        val pumpThread = Thread({
+            val scratch = FloatArray(3)
+            while (true) {
+                try {
+                    val state = getSimState()
+                    val nowMs = System.currentTimeMillis()
+                    if (state == null || !state.isMocking || activeAccelListeners.isEmpty() || (nowMs - lastNativeAccelEventMs) < 180L) {
+                        Thread.sleep(250L)
+                        continue
+                    }
+
+                    val nowNanos = SystemClock.elapsedRealtimeNanos()
+                    populateSpoofedAccelerometer(scratch, nowNanos, state)
+
+                    val entries = activeAccelListeners.entries.toList()
+                    for (entry in entries) {
+                        val info = entry.value
+                        val listener = info.weakListener.get()
+                        if (listener == null) {
+                            activeAccelListeners.remove(entry.key)
+                            continue
+                        }
+                        val ev = createFakeSensorEvent(info.sensor, scratch, nowNanos) ?: continue
+                        val h = info.targetHandler ?: mainHandler
+                        h.post {
+                            isSyntheticAccelDispatch.set(true)
+                            try {
+                                listener.onSensorChanged(ev)
+                            } catch (_: Throwable) {
+                            } finally {
+                                isSyntheticAccelDispatch.set(false)
+                            }
+                        }
+                    }
+                    Thread.sleep(20L) // 50Hz 标准运动采样率
+                } catch (_: Throwable) {
+                    try { Thread.sleep(250L) } catch (_: Throwable) {}
+                }
+            }
+        }, "HwSensorSampling")
+        pumpThread.isDaemon = true
+        pumpThread.start()
     }
 
     /**
@@ -817,7 +1053,7 @@ class XposedEntry : IXposedHookLoadPackage {
                 })
             }
 
-            // D. Hook registerGnssStatusCallback 模拟急速冷启动与 3D 卫星定位锁定
+            // D. Hook registerGnssStatusCallback 模拟急速冷启动与 3D 卫星定位锁定，并阻断模拟器 0 卫星真实状态反扑覆写
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 val gnssMethods = LocationManager::class.java.declaredMethods.filter {
                     it.name == "registerGnssStatusCallback"
@@ -826,20 +1062,45 @@ class XposedEntry : IXposedHookLoadPackage {
                     XposedBridge.hookMethod(method, object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
                             val callback = param.args.firstOrNull { it is android.location.GnssStatus.Callback } as? android.location.GnssStatus.Callback ?: return
-                            activeGnssCallbacks[System.identityHashCode(callback)] = WeakReference(callback)
+                            var targetHandler: Handler? = null
+                            var targetExecutor: Executor? = null
+                            for (arg in param.args) {
+                                if (arg is Handler) targetHandler = arg
+                                else if (arg is Executor) targetExecutor = arg
+                            }
+
+                            val info = GnssCallbackInfo(
+                                WeakReference(callback),
+                                targetHandler,
+                                targetExecutor
+                            )
+                            activeGnssCallbacks[System.identityHashCode(callback)] = info
+                            hookGnssStatusCallbackInstance(callback)
+                            ensureActiveDispatcher()
+
                             mainHandler.postDelayed({
-                                try {
-                                    val state = getSimState()
-                                    if (state != null && state.isMocking) {
-                                        callback.onStarted()
-                                        callback.onFirstFix(800)
-                                        val status = buildSyntheticGnssStatus()
+                                val state = getSimState()
+                                if (state != null && state.isMocking) {
+                                    val status = buildSyntheticGnssStatus(state)
+                                    info.dispatch(mainHandler) { cb ->
+                                        if (!info.hasSentFirstFix) {
+                                            info.hasSentFirstFix = true
+                                            try { cb.onStarted() } catch (_: Throwable) {}
+                                            try { cb.onFirstFix(480) } catch (_: Throwable) {}
+                                        }
                                         if (status != null) {
-                                            callback.onSatelliteStatusChanged(status)
+                                            try { cb.onSatelliteStatusChanged(status) } catch (_: Throwable) {}
                                         }
                                     }
-                                } catch (_: Throwable) {}
-                            }, 300L)
+                                }
+                            }, 180L)
+                        }
+
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            val state = getSimState() ?: return
+                            if (state.isMocking && (param.method as? java.lang.reflect.Method)?.returnType == Boolean::class.javaPrimitiveType) {
+                                param.result = true
+                            }
                         }
                     })
                 }
@@ -1060,8 +1321,36 @@ class XposedEntry : IXposedHookLoadPackage {
     }
 
     /**
+     * 拦截 GnssStatus.Callback.onSatelliteStatusChanged，防止模拟器/室内真实 0 卫星回调将模拟满格信号覆写为弱信号
+     */
+    private fun hookGnssStatusCallbackInstance(callback: android.location.GnssStatus.Callback) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
+        val hash = System.identityHashCode(callback)
+        if (hookedGnssCallbacks.putIfAbsent(hash, true) != null) return
+
+        try {
+            val method = callback.javaClass.getMethod("onSatelliteStatusChanged", android.location.GnssStatus::class.java)
+            XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val state = getSimState() ?: return
+                    if (!state.isMocking) return
+                    val incoming = param.args[0] as? android.location.GnssStatus
+                    if (incoming == null || incoming.satelliteCount < 10) {
+                        val synthetic = buildSyntheticGnssStatus(state)
+                        if (synthetic != null) {
+                            param.args[0] = synthetic
+                        } else {
+                            param.result = null
+                        }
+                    }
+                }
+            })
+        } catch (_: Throwable) {}
+    }
+
+    /**
      * 启动进程内主动定时推送调度器（严格基于目标线程上下文投递，拒绝裸调造成 WrongThreadException）
-     * 采用伪装的系统硬件线程名 "HwSensorEventAck" 与自适应休眠策略，兼顾 2.5Hz 丝滑轨迹推送与后台零功耗隐身
+     * 采用伪装的系统硬件线程名 "HwSensorEventAck" 与自适应休眠策略，兼顾 2.8Hz 丝滑轨迹推送与后台零功耗隐身
      */
     private fun ensureActiveDispatcher() {
         if (isDispatcherRunning) return
@@ -1070,14 +1359,14 @@ class XposedEntry : IXposedHookLoadPackage {
             isDispatcherRunning = true
 
             val dispatcherThread = Thread({
-                var lastOneHzDispatchTime = 0L
+                var lastStepAndGnssDispatchTime = 0L
                 while (true) {
                     try {
                         val state = getSimState()
                         val isActive = state != null && state.isMocking
-                        Thread.sleep(if (isActive) 400L else 2000L)
+                        Thread.sleep(if (isActive) 350L else 1200L)
 
-                        val currentState = if (isActive) (getSimState() ?: state) else null
+                        val currentState = getSimState()
                         if (currentState != null && currentState.isMocking) {
                             // 定期清理已被 GC 回收的无效引用（弱引用双保险）
                             val iterator = activeDispatchers.entries.iterator()
@@ -1100,19 +1389,24 @@ class XposedEntry : IXposedHookLoadPackage {
                             }
 
                             val nowMillis = System.currentTimeMillis()
-                            if (nowMillis - lastOneHzDispatchTime >= 950L) {
-                                lastOneHzDispatchTime = nowMillis
+                            if (nowMillis - lastStepAndGnssDispatchTime >= 700L) {
+                                lastStepAndGnssDispatchTime = nowMillis
 
-                                // 计步器主动仿真事件分发（为无物理计步器的模拟器与静止真机主动推送步数事件）
-                                if (activeStepListeners.isNotEmpty() && currentState.totalSteps > 0 && (currentState.totalSteps != lastDispatchedStepCount || currentState.speed > 0.35f)) {
+                                // 计步器主动仿真事件分发（为无物理计步器的模拟器与静止真机主动推送严格单调递增步数事件）
+                                if (activeStepListeners.isNotEmpty() && (currentState.totalSteps != lastDispatchedStepCount || currentState.speed > 0.35f)) {
                                     if (currentState.totalSteps < lastDispatchedStepCount) {
-                                        lastDispatchedStepCount = -1L // 新会话重置
+                                        lastDispatchedStepCount = -1L // 新会话重置增量跟踪，但全局步数保持单调累加
                                     }
                                     if (!hasCapturedRealHardwareStep) {
                                         hasCapturedRealHardwareStep = true // 永久锁定基准，严禁派发过程中突跳
                                     }
-                                    val stepDelta = if (lastDispatchedStepCount >= 0) (currentState.totalSteps - lastDispatchedStepCount).coerceIn(1L, 4L).toInt() else 1
+                                    val stepDelta = if (lastDispatchedStepCount >= 0 && currentState.totalSteps > lastDispatchedStepCount) {
+                                        (currentState.totalSteps - lastDispatchedStepCount).coerceIn(1L, 4L).toInt()
+                                    } else {
+                                        if (currentState.speed > 0.35f) 1 else 0
+                                    }
                                     lastDispatchedStepCount = currentState.totalSteps
+                                    val monotonicStepVal = computeMonotonicStepCounterValue(currentState.totalSteps)
 
                                     val activeStepEntries = activeStepListeners.entries.toList()
                                     val hasCounterListener = activeStepEntries.any { it.value.sensor.type == Sensor.TYPE_STEP_COUNTER && it.value.isAlive() }
@@ -1125,23 +1419,21 @@ class XposedEntry : IXposedHookLoadPackage {
                                             continue
                                         }
                                         if (info.sensor.type == Sensor.TYPE_STEP_COUNTER) {
-                                            val stepVal = baseHardwareSteps + currentState.totalSteps.toFloat()
-                                            val event = createFakeSensorEvent(info.sensor, stepVal)
+                                            val event = createFakeSensorEvent(info.sensor, monotonicStepVal)
                                             if (event != null) {
                                                 val h = info.targetHandler ?: mainHandler
                                                 h.post {
                                                     try { listener.onSensorChanged(event) } catch (_: Throwable) {}
                                                 }
                                             }
-                                        } else if (info.sensor.type == Sensor.TYPE_STEP_DETECTOR) {
+                                        } else if (info.sensor.type == Sensor.TYPE_STEP_DETECTOR && stepDelta > 0) {
                                             // 核心防冲突：若宿主 App 已注册 TYPE_STEP_COUNTER，由权威计数器独占更新，严禁同时推送 STEP_DETECTOR
                                             if (hasCounterListener) {
                                                 continue
                                             }
-                                            // 当且仅当应用仅监听 STEP_DETECTOR 时，依据实际配速步数增量均匀离散派发单步检测事件
                                             val h = info.targetHandler ?: mainHandler
                                             for (subStep in 1..stepDelta) {
-                                                val subDelay = (subStep - 1) * (1000L / stepDelta)
+                                                val subDelay = (subStep - 1) * (700L / stepDelta)
                                                 h.postDelayed({
                                                     val ev = createFakeSensorEvent(info.sensor, 1.0f)
                                                     if (ev != null) {
@@ -1153,20 +1445,24 @@ class XposedEntry : IXposedHookLoadPackage {
                                     }
                                 }
 
-                                // GNSS 卫星状态主动仿真事件推流（持续向高德/百度等地图 SDK 提供有效卫星与强信号）
+                                // GNSS 卫星状态主动仿真事件推流（严格遵循注册 Handler/Executor，自动补发首次锁定事件）
                                 if (activeGnssCallbacks.isNotEmpty() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                                    val status = buildSyntheticGnssStatus()
+                                    val status = buildSyntheticGnssStatus(currentState)
                                     if (status != null) {
-                                        val gnssIterator = activeGnssCallbacks.entries.iterator()
-                                        while (gnssIterator.hasNext()) {
-                                            val entry = gnssIterator.next()
-                                            val cb = entry.value.get()
-                                            if (cb == null) {
-                                                gnssIterator.remove()
-                                            } else {
-                                                mainHandler.post {
-                                                    try { cb.onSatelliteStatusChanged(status) } catch (_: Throwable) {}
+                                        val gnssEntries = activeGnssCallbacks.entries.toList()
+                                        for (entry in gnssEntries) {
+                                            val info = entry.value
+                                            if (!info.isAlive()) {
+                                                activeGnssCallbacks.remove(entry.key)
+                                                continue
+                                            }
+                                            info.dispatch(mainHandler) { cb ->
+                                                if (!info.hasSentFirstFix) {
+                                                    info.hasSentFirstFix = true
+                                                    try { cb.onStarted() } catch (_: Throwable) {}
+                                                    try { cb.onFirstFix(480) } catch (_: Throwable) {}
                                                 }
+                                                try { cb.onSatelliteStatusChanged(status) } catch (_: Throwable) {}
                                             }
                                         }
                                     }
@@ -1187,6 +1483,10 @@ class XposedEntry : IXposedHookLoadPackage {
                                         }
                                     }
                                 }
+                            }
+                        } else {
+                            for (info in activeGnssCallbacks.values) {
+                                info.hasSentFirstFix = false
                             }
                         }
                     } catch (_: Throwable) {}
@@ -1458,25 +1758,46 @@ class XposedEntry : IXposedHookLoadPackage {
     }
 
     /**
-     * 构造用于主动回调投递的虚拟 SensorEvent 事件实例
+     * 构造用于主动回调投递的虚拟 SensorEvent 事件实例（兼容单维计步器与三维加速度计数组）
      */
     private fun createFakeSensorEvent(sensor: Sensor, stepValue: Float): SensorEvent? {
+        return createFakeSensorEvent(sensor, floatArrayOf(stepValue), SystemClock.elapsedRealtimeNanos())
+    }
+
+    private fun createFakeSensorEvent(
+        sensor: Sensor,
+        sourceValues: FloatArray,
+        timestampNanos: Long = SystemClock.elapsedRealtimeNanos()
+    ): SensorEvent? {
         return try {
+            val minSize = sourceValues.size.coerceAtLeast(3)
             val event = try {
-                XposedHelpers.newInstance(SensorEvent::class.java, 4) as SensorEvent
+                XposedHelpers.newInstance(SensorEvent::class.java, minSize) as SensorEvent
             } catch (_: Throwable) {
                 try {
-                    XposedHelpers.newInstance(SensorEvent::class.java, 1) as SensorEvent
+                    XposedHelpers.newInstance(
+                        SensorEvent::class.java,
+                        sensor,
+                        SensorManager.SENSOR_STATUS_ACCURACY_HIGH,
+                        timestampNanos,
+                        sourceValues.copyOf(minSize)
+                    ) as SensorEvent
                 } catch (_: Throwable) {
                     XposedHelpers.newInstance(SensorEvent::class.java) as SensorEvent
                 }
             }
             try { XposedHelpers.setObjectField(event, "sensor", sensor) } catch (_: Throwable) {}
             try { XposedHelpers.setIntField(event, "accuracy", SensorManager.SENSOR_STATUS_ACCURACY_HIGH) } catch (_: Throwable) {}
-            try { XposedHelpers.setLongField(event, "timestamp", SystemClock.elapsedRealtimeNanos()) } catch (_: Throwable) {}
-            val values = event.values
-            if (values != null && values.isNotEmpty()) {
-                values[0] = stepValue
+            try { XposedHelpers.setLongField(event, "timestamp", timestampNanos) } catch (_: Throwable) {}
+            var values = event.values
+            if (values == null || values.size < sourceValues.size) {
+                values = FloatArray(minSize)
+                try { XposedHelpers.setObjectField(event, "values", values) } catch (_: Throwable) {}
+            }
+            for (i in sourceValues.indices) {
+                if (i < values.size) {
+                    values[i] = sourceValues[i]
+                }
             }
             event
         } catch (_: Throwable) {
@@ -1485,44 +1806,50 @@ class XposedEntry : IXposedHookLoadPackage {
     }
 
     /**
-     * 构造用于主动回调投递的高保真 3D 锁定 GnssStatus 实例 (支持 12 颗 GPS + 4 颗北斗卫星)
+     * 构造用于主动回调投递的高保真 3D 锁定 GnssStatus 实例 (支持 12 颗 GPS + 5 颗北斗卫星，含自然载噪比微幅呼吸)
      */
-    private fun buildSyntheticGnssStatus(): android.location.GnssStatus? {
+    private fun buildSyntheticGnssStatus(state: RemoteState? = null): android.location.GnssStatus? {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             try {
                 val builder = android.location.GnssStatus.Builder()
-                // 12 GPS 卫星 (1~12)
+                val baseCn0 = (state?.meanCn0 ?: 34.5f).coerceIn(31.5f, 39.5f)
+                val secTick = (System.currentTimeMillis() / 1000L)
+                // 12 GPS 卫星 (PRN 1~12)
                 for (i in 1..12) {
+                    val jitter = Math.sin((secTick + i * 3L) * 0.45).toFloat() * 1.1f
+                    val cn0 = (baseCn0 + (i % 5) * 1.3f + jitter).coerceIn(31.0f, 42.5f)
                     builder.addSatellite(
                         android.location.GnssStatus.CONSTELLATION_GPS,
                         i,
-                        33.5f + (i % 5) * 1.8f, // 33.5 ~ 40.7 dB-Hz 强卫星载噪比
-                        (35.0f + (i * 3) % 40).toFloat(),   // elevation
-                        ((i * 28.0f) % 360f).toFloat(),     // azimuth
+                        cn0,
+                        (32.0f + (i * 4) % 45).toFloat(),   // elevation
+                        ((i * 29.0f) % 360f).toFloat(),     // azimuth
                         true,                   // hasEphemeris
                         true,                   // hasAlmanac
-                        true,                   // usedInFix (高德定位判定 GPS_ACCURACY_GOOD 的关键依据)
+                        true,                   // usedInFix (高德/运动世界判定 GPS_ACCURACY_GOOD 满格绿条的核心依据)
                         true,                   // hasCarrierFrequency
                         1575420000.0f,          // carrierFrequencyHz (L1)
                         true,                   // hasBasebandCn0DbHz
-                        30.5f                   // basebandCn0DbHz
+                        (cn0 - 3.0f).coerceAtLeast(28.0f)
                     )
                 }
-                // 4 北斗卫星 (1~4)
-                for (i in 1..4) {
+                // 5 北斗卫星 (PRN 1~5)
+                for (i in 1..5) {
+                    val jitter = Math.cos((secTick + i * 5L) * 0.4).toFloat() * 1.0f
+                    val cn0 = (baseCn0 + 1.5f + (i % 3) * 1.5f + jitter).coerceIn(32.5f, 43.0f)
                     builder.addSatellite(
                         android.location.GnssStatus.CONSTELLATION_BEIDOU,
                         i,
-                        35.0f + (i % 3) * 2.0f,
-                        (55.0f + (i * 4) % 25).toFloat(),
-                        ((i * 75.0f) % 360f).toFloat(),
+                        cn0,
+                        (50.0f + (i * 5) % 30).toFloat(),
+                        ((i * 71.0f) % 360f).toFloat(),
                         true,
                         true,
                         true,
                         true,
                         1561098000.0f,          // carrierFrequencyHz (B1)
                         true,
-                        32.0f
+                        (cn0 - 2.8f).coerceAtLeast(29.0f)
                     )
                 }
                 return builder.build()
@@ -1559,6 +1886,68 @@ class XposedEntry : IXposedHookLoadPackage {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val list = param.result as? List<android.content.pm.ApplicationInfo> ?: return
                         param.result = list.filter { it.packageName != "com.antigravity.geospoofer" }
+                    }
+                })
+            }
+
+            // A2. 核心防探测：拦截 getPackageInfo 与 getApplicationInfo 单点定向探测，针对自身包名抛出 NameNotFoundException
+            val getPkgInfoMethods = appPkgMgrClass.declaredMethods.filter { it.name == "getPackageInfo" }
+            for (method in getPkgInfoMethods) {
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val pkg = param.args.firstOrNull() as? String
+                        if (pkg == "com.antigravity.geospoofer") {
+                            val curPkg = lpparam.packageName
+                            val curProc = lpparam.processName
+                            if (curPkg == "com.antigravity.geospoofer" ||
+                                curProc == "com.antigravity.geospoofer" ||
+                                curProc.startsWith("com.antigravity.geospoofer:")) {
+                                return
+                            }
+                            param.throwable = android.content.pm.PackageManager.NameNotFoundException(pkg)
+                        }
+                    }
+                })
+            }
+
+            val getAppInfoMethods = appPkgMgrClass.declaredMethods.filter { it.name == "getApplicationInfo" }
+            for (method in getAppInfoMethods) {
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val pkg = param.args.firstOrNull() as? String
+                        if (pkg == "com.antigravity.geospoofer") {
+                            val curPkg = lpparam.packageName
+                            val curProc = lpparam.processName
+                            if (curPkg == "com.antigravity.geospoofer" ||
+                                curProc == "com.antigravity.geospoofer" ||
+                                curProc.startsWith("com.antigravity.geospoofer:")) {
+                                return
+                            }
+                            param.throwable = android.content.pm.PackageManager.NameNotFoundException(pkg)
+                        }
+                    }
+                })
+            }
+
+            // A3. 拦截 queryIntentActivities 与 queryIntentServices 意图查询黑名单探测
+            val queryActivitiesMethods = appPkgMgrClass.declaredMethods.filter { it.name == "queryIntentActivities" }
+            for (method in queryActivitiesMethods) {
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    @Suppress("UNCHECKED_CAST")
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val list = param.result as? List<android.content.pm.ResolveInfo> ?: return
+                        param.result = list.filter { it.activityInfo?.packageName != "com.antigravity.geospoofer" }
+                    }
+                })
+            }
+
+            val queryServicesMethods = appPkgMgrClass.declaredMethods.filter { it.name == "queryIntentServices" }
+            for (method in queryServicesMethods) {
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    @Suppress("UNCHECKED_CAST")
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val list = param.result as? List<android.content.pm.ResolveInfo> ?: return
+                        param.result = list.filter { it.serviceInfo?.packageName != "com.antigravity.geospoofer" }
                     }
                 })
             }
@@ -1708,21 +2097,222 @@ class XposedEntry : IXposedHookLoadPackage {
         return "\$$payload*${String.format(Locale.US, "%02X", checksum)}"
     }
 
+    // IPC 通道熔断与回环套接字状态（仅由后台 StateSyncDaemon 线程访问）
+    @Volatile private var providerCooldownUntilMs: Long = 0L
+    @Volatile private var udpPermissionDenied: Boolean = false
+    private var preferredUdpPort: Int = 39527
+
     /**
-     * 通过 ContentProvider 跨进程高速获取模拟状态（具备 call + query 双模降级兜底，绝不弄崩宿主 App）
+     * O(1) 无锁纳秒级获取最新模拟状态：
+     * 绝不在主线程或 100Hz 传感器回调线程内执行 Binder IPC、Socket 或磁盘 I/O，
+     * 彻底根除 HMA 拦截场景下 ActivityThread 日志洪泛、卡顿掉帧与 StrictMode 违例。
      */
     private fun getSimState(): RemoteState? {
-        val now = System.currentTimeMillis()
-        if (cachedState != null && now - lastFetchTime < 250L) {
-            return cachedState
+        ensureStateSyncDaemon()
+        if (initialSyncLatch.count > 0L) {
+            try {
+                initialSyncLatch.await(40L, TimeUnit.MILLISECONDS)
+            } catch (_: Throwable) {}
         }
+        return cachedState
+    }
 
+    private fun ensureStateSyncDaemon() {
+        if (!isStateSyncRunning.compareAndSet(false, true)) return
+        val syncThread = Thread({
+            var reusableSocket: DatagramSocket? = null
+            val sendMagic = byteArrayOf(0x4C, 0x4D, 0x50, 0x5F, 0x53, 0x59, 0x4E, 0x43) // "LMP_SYNC"
+            val recvBuffer = ByteArray(512)
+            val loopbackAddr by lazy { InetAddress.getByName("127.0.0.1") }
+
+            while (true) {
+                try {
+                    val now = System.currentTimeMillis()
+                    var synced: RemoteState? = null
+
+                    // ================= Tier 1: Loopback UDP 微内核直连 (< 0.2ms, 100% 穿透 HMA 与 Android 15 SELinux) =================
+                    if (!udpPermissionDenied) {
+                        try {
+                            if (reusableSocket == null || reusableSocket.isClosed) {
+                                reusableSocket = DatagramSocket().apply { soTimeout = 45 }
+                            }
+                            synced = queryLoopbackPort(reusableSocket, loopbackAddr, preferredUdpPort, sendMagic, recvBuffer)
+                            if (synced == null) {
+                                val altPort = if (preferredUdpPort == 39527) 39528 else 39527
+                                val altResult = queryLoopbackPort(reusableSocket, loopbackAddr, altPort, sendMagic, recvBuffer)
+                                if (altResult != null) {
+                                    preferredUdpPort = altPort
+                                    synced = altResult
+                                }
+                            }
+                        } catch (_: SecurityException) {
+                            udpPermissionDenied = true
+                            try { reusableSocket?.close() } catch (_: Throwable) {}
+                            reusableSocket = null
+                        } catch (_: Throwable) {
+                            try { reusableSocket?.close() } catch (_: Throwable) {}
+                            reusableSocket = null
+                        }
+                    }
+
+                    // ================= Tier 2: LSPosed XSharedPreferences 只读快照 (带心跳鲜活度校验防残留) =================
+                    if (synced == null) {
+                        synced = fetchFromXSharedPrefs(now)
+                    }
+
+                    // ================= Tier 3: ContentProvider (call + query 双模，带 25 秒熔断器零日志污染) =================
+                    if (synced == null && now >= providerCooldownUntilMs) {
+                        synced = fetchFromContentProvider()
+                        if (synced == null) {
+                            providerCooldownUntilMs = now + 25_000L
+                        }
+                    }
+
+                    if (synced != null) {
+                        cachedState = synced
+                    } else if (cachedState.isMocking) {
+                        // 所有通道均不可达（宿主已退出或强行停止），安全回落为非模拟态，防止目标 App 卡死在旧坐标
+                        cachedState = cachedState.copy(isMocking = false, speed = 0f, cadenceSpm = 0)
+                    }
+                } catch (_: Throwable) {
+                } finally {
+                    if (initialSyncLatch.count > 0L) {
+                        initialSyncLatch.countDown()
+                    }
+                }
+
+                try {
+                    Thread.sleep(if (cachedState.isMocking) 180L else 750L)
+                } catch (_: Throwable) {}
+            }
+        }, "HwSensorStateSync")
+        syncThread.isDaemon = true
+        syncThread.start()
+    }
+
+    private fun queryLoopbackPort(
+        socket: DatagramSocket,
+        loopbackAddr: InetAddress,
+        port: Int,
+        sendMagic: ByteArray,
+        recvBuffer: ByteArray
+    ): RemoteState? {
+        return try {
+            val req = DatagramPacket(sendMagic, sendMagic.size, loopbackAddr, port)
+            socket.send(req)
+            val resp = DatagramPacket(recvBuffer, recvBuffer.size)
+            socket.receive(resp)
+            if (resp.length < 64) return null
+
+            DataInputStream(ByteArrayInputStream(recvBuffer, 0, resp.length)).use { dis ->
+                val magic = dis.readInt()
+                if (magic != 0x4C4D5031) return null // "LMP1"
+                val isMocking = dis.readBoolean()
+                val lat = dis.readDouble()
+                val lon = dis.readDouble()
+                val alt = dis.readDouble()
+                val spd = dis.readFloat()
+                val brg = dis.readFloat()
+                val acc = dis.readFloat()
+                val sats = dis.readInt()
+                val cn0 = dis.readFloat()
+                val steps = dis.readLong()
+                val cadence = dis.readInt()
+                val ts = dis.readLong()
+                val wifiEnabled = dis.readBoolean()
+                val wifiSsid = dis.readUTF()
+                val wifiBssid = dis.readUTF()
+                val wifiRssi = dis.readInt()
+                val cellEnabled = dis.readBoolean()
+                val cellMcc = dis.readInt()
+                val cellMnc = dis.readInt()
+                val cellLac = dis.readInt()
+                val cellCid = dis.readInt()
+
+                val freshMocking = isMocking && (ts <= 0L || kotlin.math.abs(System.currentTimeMillis() - ts) < 15_000L)
+                RemoteState(
+                    isMocking = freshMocking,
+                    latitude = lat,
+                    longitude = lon,
+                    altitude = alt,
+                    speed = if (freshMocking) spd else 0f,
+                    bearing = brg,
+                    accuracy = acc,
+                    satellites = sats,
+                    meanCn0 = cn0,
+                    totalSteps = steps,
+                    cadenceSpm = if (freshMocking) cadence else 0,
+                    wifiMockEnabled = wifiEnabled,
+                    wifiSsid = wifiSsid.ifBlank { "Company-Office-5G" },
+                    wifiBssid = wifiBssid.ifBlank { "00:1a:2b:3c:4d:5e" },
+                    wifiRssi = wifiRssi,
+                    cellMockEnabled = cellEnabled,
+                    cellMcc = cellMcc,
+                    cellMnc = cellMnc,
+                    cellLac = cellLac,
+                    cellCid = cellCid
+                )
+            }
+        } catch (_: SecurityException) {
+            throw SecurityException("UDP disallowed")
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun fetchFromXSharedPrefs(now: Long): RemoteState? {
+        val prefs = getXSharedPrefs() ?: return null
+        return try {
+            prefs.reload()
+            if (!prefs.contains("is_mocking") && !prefs.contains("latitude_f") && !prefs.contains("latitude_str")) {
+                return null
+            }
+            val rawMocking = prefs.getBoolean("is_mocking", false)
+            val ts = prefs.getLong("timestamp", 0L)
+            // 若 XML 中记录正在模拟但时间戳超过 8 秒未刷新，判定宿主已被杀进程，自动熔断停止模拟
+            val effectiveMocking = rawMocking && (ts > 0L && (now - ts) < 8_000L)
+
+            val latStr = prefs.getString("latitude_str", null)
+            val lonStr = prefs.getString("longitude_str", null)
+            val altStr = prefs.getString("altitude_str", null)
+
+            val lat = latStr?.toDoubleOrNull() ?: prefs.getFloat("latitude_f", 39.908823f).toDouble()
+            val lon = lonStr?.toDoubleOrNull() ?: prefs.getFloat("longitude_f", 116.397470f).toDouble()
+            val alt = altStr?.toDoubleOrNull() ?: prefs.getFloat("altitude_f", 35.0f).toDouble()
+
+            RemoteState(
+                isMocking = effectiveMocking,
+                latitude = lat,
+                longitude = lon,
+                altitude = alt,
+                speed = if (effectiveMocking) prefs.getFloat("speed", 0f) else 0f,
+                bearing = prefs.getFloat("bearing", 0f),
+                accuracy = prefs.getFloat("accuracy", 3.2f),
+                satellites = prefs.getInt("satellites", 16),
+                meanCn0 = prefs.getFloat("mean_cn0", 35.5f),
+                totalSteps = prefs.getLong("total_steps", 0L),
+                cadenceSpm = if (effectiveMocking) prefs.getInt("cadence_spm", 0) else 0,
+                wifiMockEnabled = prefs.getBoolean("wifi_mock_enabled", false),
+                wifiSsid = prefs.getString("wifi_ssid", "Company-Office-5G") ?: "Company-Office-5G",
+                wifiBssid = prefs.getString("wifi_bssid", "00:1a:2b:3c:4d:5e") ?: "00:1a:2b:3c:4d:5e",
+                wifiRssi = prefs.getInt("wifi_rssi", -52),
+                cellMockEnabled = prefs.getBoolean("cell_mock_enabled", false),
+                cellMcc = prefs.getInt("cell_mcc", 460),
+                cellMnc = prefs.getInt("cell_mnc", 0),
+                cellLac = prefs.getInt("cell_lac", 41021),
+                cellCid = prefs.getInt("cell_cid", 1892341)
+            )
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun fetchFromContentProvider(): RemoteState? {
         return try {
             val activityThreadClass = Class.forName("android.app.ActivityThread")
             val currentAppMethod = activityThreadClass.getMethod("currentApplication")
-            val context = currentAppMethod.invoke(null) as? Context ?: return cachedState ?: defaultState
+            val context = currentAppMethod.invoke(null) as? Context ?: return null
 
-            // 优先尝试 call() 极速 IPC
             val bundle = try {
                 context.contentResolver.call(
                     Uri.parse("content://com.antigravity.geospoofer.provider"),
@@ -1735,7 +2325,7 @@ class XposedEntry : IXposedHookLoadPackage {
             }
 
             if (bundle != null) {
-                val state = RemoteState(
+                return RemoteState(
                     isMocking = bundle.getBoolean("is_mocking", false),
                     latitude = bundle.getDouble("latitude", 39.908823),
                     longitude = bundle.getDouble("longitude", 116.397470),
@@ -1757,12 +2347,8 @@ class XposedEntry : IXposedHookLoadPackage {
                     cellLac = bundle.getInt("cell_lac", 41021),
                     cellCid = bundle.getInt("cell_cid", 1892341)
                 )
-                cachedState = state
-                lastFetchTime = now
-                return state
             }
 
-            // 备用尝试 query() 降级
             var queryCursor: Cursor? = null
             try {
                 queryCursor = context.contentResolver.query(
@@ -1776,7 +2362,7 @@ class XposedEntry : IXposedHookLoadPackage {
                     val accIdx = queryCursor.getColumnIndex("accuracy")
                     val satsIdx = queryCursor.getColumnIndex("satellites")
                     val cn0Idx = queryCursor.getColumnIndex("mean_cn0")
-                    val state = RemoteState(
+                    return RemoteState(
                         isMocking = queryCursor.getInt(queryCursor.getColumnIndexOrThrow("is_mocking")) == 1,
                         latitude = queryCursor.getDouble(queryCursor.getColumnIndexOrThrow("latitude")),
                         longitude = queryCursor.getDouble(queryCursor.getColumnIndexOrThrow("longitude")),
@@ -1798,61 +2384,14 @@ class XposedEntry : IXposedHookLoadPackage {
                         cellLac = queryCursor.getInt(queryCursor.getColumnIndexOrThrow("cell_lac")),
                         cellCid = queryCursor.getInt(queryCursor.getColumnIndexOrThrow("cell_cid"))
                     )
-                    cachedState = state
-                    lastFetchTime = now
-                    return state
                 }
             } catch (_: Throwable) {
             } finally {
                 queryCursor?.close()
             }
-
-            // 终极只读 IPC 通道预案：尝试 LSPosed 原生 XSharedPreferences 读取（穿透 Android 11+ Package Visibility 隔离）
-            val prefs = getXSharedPrefs()
-            if (prefs != null) {
-                try {
-                    prefs.reload()
-                    if (prefs.contains("is_mocking") || prefs.contains("latitude_f") || prefs.contains("latitude_str")) {
-                        val latStr = prefs.getString("latitude_str", null)
-                        val lonStr = prefs.getString("longitude_str", null)
-                        val altStr = prefs.getString("altitude_str", null)
-
-                        val lat = latStr?.toDoubleOrNull() ?: prefs.getFloat("latitude_f", 39.908823f).toDouble()
-                        val lon = lonStr?.toDoubleOrNull() ?: prefs.getFloat("longitude_f", 116.397470f).toDouble()
-                        val alt = altStr?.toDoubleOrNull() ?: prefs.getFloat("altitude_f", 35.0f).toDouble()
-
-                        val state = RemoteState(
-                            isMocking = prefs.getBoolean("is_mocking", false),
-                            latitude = lat,
-                            longitude = lon,
-                            altitude = alt,
-                            speed = prefs.getFloat("speed", 0f),
-                            bearing = prefs.getFloat("bearing", 0f),
-                            accuracy = prefs.getFloat("accuracy", 3.2f),
-                            satellites = prefs.getInt("satellites", 16),
-                            meanCn0 = prefs.getFloat("mean_cn0", 35.5f),
-                            totalSteps = prefs.getLong("total_steps", 0L),
-                            cadenceSpm = prefs.getInt("cadence_spm", 0),
-                            wifiMockEnabled = prefs.getBoolean("wifi_mock_enabled", false),
-                            wifiSsid = prefs.getString("wifi_ssid", "Company-Office-5G") ?: "Company-Office-5G",
-                            wifiBssid = prefs.getString("wifi_bssid", "00:1a:2b:3c:4d:5e") ?: "00:1a:2b:3c:4d:5e",
-                            wifiRssi = prefs.getInt("wifi_rssi", -52),
-                            cellMockEnabled = prefs.getBoolean("cell_mock_enabled", false),
-                            cellMcc = prefs.getInt("cell_mcc", 460),
-                            cellMnc = prefs.getInt("cell_mnc", 0),
-                            cellLac = prefs.getInt("cell_lac", 41021),
-                            cellCid = prefs.getInt("cell_cid", 1892341)
-                        )
-                        cachedState = state
-                        lastFetchTime = now
-                        return state
-                    }
-                } catch (_: Throwable) {}
-            }
-
-            cachedState ?: defaultState
+            null
         } catch (_: Throwable) {
-            cachedState ?: defaultState
+            null
         }
     }
 }

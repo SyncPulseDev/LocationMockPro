@@ -97,7 +97,12 @@ class RouteSimulator(
     fun pauseSimulation() {
         if (!isSimulating || isPaused) return
         isPaused = true
-        _simulationState.value = _simulationState.value.copy(isPaused = true)
+        LocationStateProvider.updateSteps(_simulationState.value.totalSteps, 0)
+        _simulationState.value = _simulationState.value.copy(
+            isPaused = true,
+            currentSpeedMps = 0f,
+            cadenceSpm = 0
+        )
     }
 
     /**

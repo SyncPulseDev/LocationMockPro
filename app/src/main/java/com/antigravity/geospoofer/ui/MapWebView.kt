@@ -6,6 +6,7 @@ import android.os.Looper
 import android.view.MotionEvent
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -224,7 +225,17 @@ fun InteractiveMapCard(
                         }
 
                         webChromeClient = WebChromeClient()
-                        webViewClient = object : WebViewClient() {}
+                        webViewClient = object : WebViewClient() {
+                            override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                                try {
+                                    (view?.parent as? ViewGroup)?.removeView(view)
+                                    view?.destroy()
+                                } catch (_: Throwable) {}
+                                controller.webView = null
+                                controller.isReady = false
+                                return true
+                            }
+                        }
 
                         val bridge = AndroidMapBridge(
                             onReady = {

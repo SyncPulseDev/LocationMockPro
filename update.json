@@ -1,9 +1,9 @@
 {
-  "versionCode": 14,
-  "versionName": "1.2.9",
-  "downloadUrl": "https://github.com/SyncPulseDev/LocationMockPro/releases/download/v1.2.9/app-release.apk",
-  "changelog": "1. ✨ 现代流光玻璃拟态界面重构（Luminous Midnight Glassmorphism）：采用深邃星夜底色与随运行状态动态呼吸转换的极光散射光晕（Ambient Aurora Nebula），全面升级斜向高光折射毛玻璃卡片、顶部流光反射细线、5 色独立宝石微光轨迹工具箱磁贴与极光悬浮分段导航坞；\n2. 🚀 新增地图下方「悬浮流光速控舱」：在单点定位与路线巡航地图卡片正下方实时呈现锁止坐标或航线总里程（km），无需滚到底部即可一键启停单点模拟与路线巡航；\n3. 🗺️ 高德地图浮层与长轨迹折叠优化：搜索框、右侧工具按钮与提示条同步升级为深海毛玻璃与极光高亮样式，支持密集路点智能折叠与一键复制坐标，Release 安装包体积精简至 1.22 MB。",
-  "fileSize": 1276582,
-  "publishDate": "2026-11-06",
+  "versionCode": 17,
+  "versionName": "1.3.2",
+  "downloadUrl": "https://github.com/SyncPulseDev/LocationMockPro/releases/download/v1.3.2/app-release.apk",
+  "changelog": "1. 🚀 跨进程 Loopback UDP 微内核 + New XSharedPreferences 三模容错 IPC：全面绕过 Android 15 SELinux 隔离与 Hide My Applist (HMA) 隐身拦截，根除 Failed to find provider info 刷屏并避免主线程 5s ANR；\n2. 🏃 App 感知型步态仿真与跨会话单调计步锁：为 Keep 等 DSP 步频算法提供 50Hz 相位连续三轴步态波与保底泵（实测 5km/h 收敛 116 SPM / 0.71m 步幅），为校园跑多传感器 App 保留 Sub-threshold 手持微颤防止步频翻倍，并在多轮启停间锁定 TYPE_STEP_COUNTER 严格单调递增；\n3. 🛰️ GNSS 卫星状态与生命周期全闭环：严格对齐宿主 Handler/Executor 线程亲和派发，主动拦截低星数(<10 颗)真实回调并合成 17 颗全绿 GPS+北斗 3D 锁定状态（Keep / 运动世界稳定绿 3 格）；stopRoute 同步释放定位提供者并联动归零；\n4. 🛡️ 定向反扫描护盾、WebView 渲染防崩与全套新图标：拦截 getPackageInfo / getApplicationInfo / Intent 黑名单定向探测，新增 WebView 渲染进程崩溃自愈恢复，升级流光极光指南针自适应启动图标。",
+  "fileSize": 1370374,
+  "publishDate": "2026-11-08",
   "forceUpdate": false
 }

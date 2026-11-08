@@ -2,11 +2,11 @@
 
 [![Android](https://img.shields.io/badge/Platform-Android%208.0%20~%2015%20(API%2026--35)-brightgreen.svg)](https://developer.android.com)
 [![Architecture Rating](https://img.shields.io/badge/Architecture%20Review-S%2B%20(Production--Ready)-success.svg)](https://github.com/SyncPulseDev/LocationMockPro)
-[![Version](https://img.shields.io/badge/Version-v1.2.9-blue.svg)](https://github.com/SyncPulseDev/LocationMockPro/releases)
+[![Version](https://img.shields.io/badge/Version-v1.3.2-blue.svg)](https://github.com/SyncPulseDev/LocationMockPro/releases)
 [![LSPosed](https://img.shields.io/badge/Module-LSPosed%20%2F%20Xposed%20Supported-purple.svg)](https://github.com/LSPosed/LSPosed)
 [![Kotlin](https://img.shields.io/badge/Language-Kotlin%202.0%2B-blue.svg)](https://kotlinlang.org)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose%20M3-purple.svg)](https://developer.android.com/jetpack/compose)
-[![Release Package](https://img.shields.io/badge/Release%20APK-1.22%20MB%20(R8%20Optimized)-informational.svg)](https://github.com/SyncPulseDev/LocationMockPro/releases)
+[![Release Package](https://img.shields.io/badge/Release%20APK-1.31%20MB%20(R8%20Optimized)-informational.svg)](https://github.com/SyncPulseDev/LocationMockPro/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg)](LICENSE)
 
 `LocationMockPro` 是一套面向移动安全研究、高精度自动化测试与地理位置算法验证的 **工业级 Android 深度仿真框架**。项目不仅提供全套高拟真传感器动力学算法与跨 Tab 零重载高德地图交互，更深度集成了原生 **LSPosed / Xposed 系统底层免杀 Hook 引擎**，具备全闭环的物理与无线电环境指纹伪装能力，正式获评 **S+ 级（Release 产线封版状态）** 工业级交付标准。
@@ -49,10 +49,10 @@
 ### 6. 🛡️ 前台服务强保活与三级低延迟 IPC 容错防崩
 - **前台服务强生命周期守护**：显式结合 `startForegroundService` 与 `bindService`，彻底解决切出后台/锁屏时 Activity 销毁导致模拟定位服务被系统回收的致命缺陷。
 - **`WeakReference` 闭包解耦双保险**：`ListenerDispatcher` 采用弱引用持有宿主 `LocationListener`，在派发 Runnable 内部**二次动态解引** `weakRef.get()`，结合 `pruneStaleDispatchers()` 存活性清扫，根除长尾劣质 App 忘记注销引发的 Activity 内存泄漏。
-- **三级容错 IPC 通道与异步节流落盘**：
-  - **Tier 1**：毫秒级 `ContentResolver.call("getState")` 极速跨进程内存通信（250ms 高频刷新）；
-  - **Tier 2**：`ContentResolver.query()` 基于 `MatrixCursor` 自动降级退避；
-  - **Tier 3**：LSPosed 原生 `XSharedPreferences`（`location_mock_pro_stealth_prefs`）只读持久化兜底，后台独立 I/O 线程按 1Hz 节流同步 `commit()` 并自动维持 `0644` 跨进程可读权限，彻底消除高频 `apply()` 原子重命名导致的权限丢失与主线程 `QueuedWork` 卡顿。
+- **三级无阻塞容错 IPC 通道与 HMA/SELinux 终极穿透**：
+  - **Tier 1（Loopback UDP 微内核）**：绑定本机回环端口 `127.0.0.1:39527`（备用 `39528`）构建亚毫秒级二进制协议同步通道，后台守护线程轮询维护 `@Volatile cachedState` 无锁内存快照，`getSimState()` 实现 `O(1)` 零阻塞读取，彻底绕过 Android 15 SELinux 限制与 Hide My Applist (HMA) 的 ContentProvider 隐藏拦截；
+  - **Tier 2（New `XSharedPreferences`）**：清单开启 `xposedsharedprefs` 并配合 `MODE_WORLD_READABLE` 自动持久化降级策略，即使后台保活服务未唤醒仍可离线读取最新坐标与无线电指纹；
+  - **Tier 3（`ContentProvider` 熔断降级兜底）**：保留 `ContentResolver.call` / `MatrixCursor` 双模通道并内置 25 秒失败熔断断路器，杜绝 HMA 屏蔽环境下 `Failed to find provider info` 日志刷屏与 5 秒 binder 超时卡顿。
 
 ### 7. 🔄 智能在线自动更新与 Root 静默热升级 (`UpdateManager.kt`)
 - **双通道云端版本检测**：基于 GitHub Releases API 与轻量 `update.json` 双协议检测，冷启动智能轻量探测，严格遵循 SemVer 语义化版本规范。
@@ -114,11 +114,27 @@ LocationMockPro/
 | 构建模式 | 执行命令 | 产物路径 | 体积 | 特性说明 |
 | :--- | :--- | :--- | :---: | :--- |
 | **Debug** | `./gradlew assembleDebug` | `app/build/outputs/apk/debug/app-debug.apk` | 15.4 MB | 包含完整调试符号，开发联调首选 |
-| **Release** | `./gradlew assembleRelease` | `app/build/outputs/apk/release/app-release.apk` | **1.49 MB** | **R8 生产级混淆**、压缩率超 90%、去除冗余依赖、入口类安全留存 |
+| **Release** | `./gradlew assembleRelease` | `app/build/outputs/apk/release/app-release.apk` | **1.31 MB** | **R8 生产级混淆**、压缩率超 90%、去除冗余依赖、入口类安全留存 |
 
 ---
 
 ## 📝 更新日志 (Changelog)
+
+### v1.3.2 (Build 17) - 2026-11-08
+- **🚀 Loopback UDP 微内核与无锁 IPC 重构（100% 穿透 Android 15 & HMA）**：
+  - 在 `LocationStateProvider` 内建仅限本机回环的 `127.0.0.1:39527`（备选 `39528`）UDP 二进制微桥接服务端（`<0.2ms` RAM 内存直传），`XposedEntry` 端由后台 `StateSyncDaemon` 守护线程维持 `@Volatile cachedState` `O(1)` 无锁缓存，`getSimState()` 彻底免除主线程 Binder/I/O 阻塞；
+  - 开启标准 `xposedsharedprefs` 声明与 8 秒状态新鲜度校验，并为 `ContentProvider` 通道配置 25 秒失败熔断器，彻底消除运动世界 / Keep 在 HMA 隔离下出现的 `Failed to find provider info` 日志刷屏。
+- **🏃 App 感知型步态仿真与跨会话计步单调锁定**：
+  - 引入持续角相位积分算法（消除变频变速时 `2π·f(t)·t` 造成的相位倒流跳变），配合 **50Hz 独立加速度计保底泵**，在 Keep 等仅依赖加速度计 DSP 算法且模拟器物理硬件静默的环境中输出完整 3 轴步态波（实测 5 km/h 巡航稳态输出 **平均步频 116 SPM / 平均步幅 0.71 米**）；
+  - 对同时监听 `TYPE_STEP_COUNTER` 的校园跑多传感器应用智能仲裁为亚阈值手持微颤（`±0.05 m/s²`，方差 > 0 且不产生额外伪峰步数），严防三源叠加导致步频翻倍；
+  - 引入全局单调基线锁 `computeMonotonicStepCounterValue()`，确保多次启停路线巡航时 `TYPE_STEP_COUNTER` 累计步数严格单调递增不倒退。
+- **🛰️ GNSS 卫星状态与生命周期全闭环**：
+  - `GnssCallbackInfo` 严格遵守宿主注册的 `Handler` / `Executor` 线程亲和派发，主动拦截并抑制低星数（`<10` 颗）真实系统回调，稳定合成 17 颗全绿卫星（12 GPS + 5 北斗）3D 锁定状态（Keep / 运动世界校园稳态显示 **绿色 3 格 `GPS |||`**）；
+  - 修复 `MockLocationService.stopRoute()` 遗留后台心跳线程问题，与 `RouteSimulator.pauseSimulation()` 及 `startMock()` 统一联动归零速度与步频。
+- **🛡️ 反扫描定向隐身、WebView 崩溃自愈与新图标升级（整合 v1.3.1 演进）**：
+  - 扩充 `hookPackageVisibility`：新增 `getPackageInfo` / `getApplicationInfo` 定向探测抛出 `NameNotFoundException` 隐身拦截与 `queryIntentActivities` / `queryIntentServices` 过滤；
+  - `MapWebView` 增加 `onRenderProcessGone` 渲染进程崩溃安全回收与自愈重连；
+  - 全套升级蓝青极光渐变指南针自适应启动图标（含 `mdpi ~ xxxhdpi` 全密度切图）。
 
 ### v1.2.9 (Build 14) - 2026-11-06
 - **✨ 现代流光玻璃拟态设计体系重构 (Luminous Midnight Glassmorphism)**：

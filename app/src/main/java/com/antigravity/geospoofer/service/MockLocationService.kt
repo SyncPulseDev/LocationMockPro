@@ -91,9 +91,11 @@ class MockLocationService : Service() {
      */
     fun startMock(lat: Double, lon: Double): Boolean {
         startForegroundSafely("正在模拟定位: $lat, $lon")
+        routeSimulator.stopSimulation()
+        com.antigravity.geospoofer.provider.LocationStateProvider.resetSimulationSession()
         val started = engine.start()
         if (started) {
-            engine.updateLocation(lat, lon)
+            engine.updateLocation(lat, lon, speed = 0f, bearing = 0f)
             startHeartbeat()
         }
         return started
@@ -124,11 +126,10 @@ class MockLocationService : Service() {
     }
 
     /**
-     * 停止路线模拟运动
+     * 停止路线模拟运动（同步释放模拟提供者与后台服务，保持与 UI「待命中」状态严格一致；原地驻留请使用 pauseRoute）
      */
     fun stopRoute() {
-        routeSimulator.stopSimulation()
-        startHeartbeat()
+        stopMock()
     }
 
     /**
